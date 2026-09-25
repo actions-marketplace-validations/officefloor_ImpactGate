@@ -38,9 +38,10 @@ class GitRepo:
     def __init__(self, path: str):
         self.path = path
         self._batch: subprocess.Popen | None = None
+        self._batch_z: bool | None = None
 
     def _run(self, *args: str) -> str:
-        out = subprocess.run(["git", "-C", self.path, *args],
+        out = subprocess.run(["git", "-C", self.path, "-c", "diff.mnemonicprefix=false", *args],
                              check=True, capture_output=True)
         return out.stdout.decode("utf-8", errors="replace")
 
@@ -51,13 +52,38 @@ class GitRepo:
         return parse_diff(text)
 
     # ---- blob streaming via a persistent cat-file --batch -----------------
+    def _supports_batch_z(self) -> bool:
+        # cat-file --batch -Z (NUL-delimited I/O) needs git >= 2.42; older git
+        # exits non-zero on the unknown option. Probe once and fall back to the
+        # newline protocol so older environments keep working (a filename with a
+        # literal newline is then the only case that stays broken).
+        if self._batch_z is None:
+            probe = subprocess.run(
+                ["git", "-C", self.path, "cat-file", "--batch", "-Z"],
+                input=b"", capture_output=True,
+            )
+            self._batch_z = probe.returncode == 0
+        return self._batch_z
+
     def _ensure_batch(self) -> subprocess.Popen:
         if self._batch is None or self._batch.poll() is not None:
+            args = ["git", "-C", self.path, "cat-file", "--batch"]
+            if self._supports_batch_z():
+                args.append("-Z")
             self._batch = subprocess.Popen(
-                ["git", "-C", self.path, "cat-file", "--batch"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             )
         return self._batch
+
+    @staticmethod
+    def _read_until_nul(stream) -> bytes:
+        out = bytearray()
+        while True:
+            b = stream.read(1)
+            if not b or b == b"\0":
+                break
+            out += b
+        return bytes(out)
 
     def blob(self, rev: str, path: str) -> tuple[str, bytes] | None:
         """(<blob oid>, contents) of <rev>:<path>, or None if absent.
@@ -67,9 +93,13 @@ class GitRepo:
         """
         proc = self._ensure_batch()
         assert proc.stdin and proc.stdout
-        proc.stdin.write(f"{rev}:{path}\n".encode())
+        z = self._supports_batch_z()
+        proc.stdin.write(f"{rev}:{path}".encode() + (b"\0" if z else b"\n"))
         proc.stdin.flush()
-        header = proc.stdout.readline().decode("utf-8", errors="replace").strip()
+        if z:
+            header = self._read_until_nul(proc.stdout).decode("utf-8", errors="replace")
+        else:
+            header = proc.stdout.readline().decode("utf-8", errors="replace").strip()
         if not header or header.endswith(("missing", "ambiguous")):
             return None
         parts = header.split()
@@ -79,7 +109,7 @@ class GitRepo:
         except ValueError:
             return None
         data = proc.stdout.read(size)
-        proc.stdout.read(1)  # trailing newline
+        proc.stdout.read(1)  # trailing NUL (-Z) or newline
         return oid, data
 
     def close(self) -> None:
@@ -111,37 +141,56 @@ def _parse_hunk_header(line: str) -> Hunk | None:
         return None
 
 
+def _dequote_path(raw: str) -> str:
+    """Reverse git's C-style diff path quoting (default core.quotePath=true).
+
+    A path with special or non-ASCII bytes appears wrapped in double quotes with
+    C escapes, e.g. `"caf\303\251.py"` for `café.py`. Returns the raw path
+    unchanged if it isn't quoted.
+    """
+    if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
+        return raw
+    body = raw[1:-1]
+    out = bytearray()
+    i = 0
+    simple_escapes = {"\\": "\\", '"': '"', "a": "\a", "b": "\b", "f": "\f",
+                      "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            nxt = body[i + 1]
+            if nxt in "01234567":
+                j = i + 1
+                end = min(j + 3, len(body))
+                k = j
+                while k < end and body[k] in "01234567":
+                    k += 1
+                out.append(int(body[j:k], 8) & 0xFF)
+                i = k
+                continue
+            esc = simple_escapes.get(nxt)
+            if esc is not None:
+                out.extend(esc.encode("utf-8"))
+                i += 2
+                continue
+        out.extend(c.encode("utf-8"))
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
 def parse_diff(text: str) -> list[FileDiff]:
     files: list[FileDiff] = []
     cur: FileDiff | None = None
+    in_hunk = False
     for line in text.split("\n"):
         if line.startswith("diff --git "):
             cur = FileDiff()
             files.append(cur)
+            in_hunk = False
         elif cur is None:
             continue
-        elif line.startswith("new file"):
-            cur.status = "A"
-        elif line.startswith("deleted file"):
-            cur.status = "D"
-        elif line.startswith("rename from "):
-            cur.status = "R"
-            cur.old_path = line[len("rename from "):]
-        elif line.startswith("rename to "):
-            cur.new_path = line[len("rename to "):]
-        elif line.startswith("copy to "):
-            cur.new_path = line[len("copy to "):]
-        elif line.startswith("Binary files"):
-            cur.is_binary = True
-        elif line.startswith("--- "):
-            p = line[4:]
-            if p != "/dev/null":
-                cur.old_path = p[2:] if p.startswith(("a/", "b/")) else p
-        elif line.startswith("+++ "):
-            p = line[4:]
-            if p != "/dev/null":
-                cur.new_path = p[2:] if p.startswith(("a/", "b/")) else p
         elif line.startswith("@@"):
+            in_hunk = True
             h = _parse_hunk_header(line)
             if h:
                 if h.old_count > 0:
@@ -150,4 +199,29 @@ def parse_diff(text: str) -> list[FileDiff]:
                 if h.new_count > 0:
                     cur.added.append((h.new_start, h.new_count))
                     cur.add_total += h.new_count
+        elif in_hunk:
+            continue
+        elif line.startswith("new file"):
+            cur.status = "A"
+        elif line.startswith("deleted file"):
+            cur.status = "D"
+        elif line.startswith("rename from "):
+            cur.status = "R"
+            cur.old_path = _dequote_path(line[len("rename from "):])
+        elif line.startswith("rename to "):
+            cur.new_path = _dequote_path(line[len("rename to "):])
+        elif line.startswith("copy to "):
+            cur.new_path = _dequote_path(line[len("copy to "):])
+        elif line.startswith("Binary files"):
+            cur.is_binary = True
+        elif line.startswith("--- "):
+            # An unquoted path containing a space gets a trailing tab sentinel
+            # so the boundary is unambiguous; strip it before dequoting.
+            p = _dequote_path(line[4:].rstrip("\t"))
+            if p != "/dev/null":
+                cur.old_path = p[2:] if p.startswith(("a/", "b/")) else p
+        elif line.startswith("+++ "):
+            p = _dequote_path(line[4:].rstrip("\t"))
+            if p != "/dev/null":
+                cur.new_path = p[2:] if p.startswith(("a/", "b/")) else p
     return files

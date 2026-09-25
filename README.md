@@ -1,19 +1,25 @@
 # impact-gate
 
-Measure and gate the structural decay a change introduces. Run it as a standalone CLI,
-a git pre-commit hook, or a plugin in GitHub, GitLab, and Jenkins CI.
+A merge gate that flags changes piling complexity onto code that is already complex,
+before a class quietly grows into a god class nobody can safely touch. Run it as a
+standalone CLI, a git pre-commit hook, or a plugin in GitHub, GitLab, and Jenkins CI.
 
-Structural decay is complexity accreting into existing structures. A god-method grows
-another branch. A god-class gains another method. The gate scores a change against a
-base (`main` by default) with the change-impact measure:
+Website: https://impactgate.officefloor.net
+
+The pattern it catches is gradual. A class gains one more method, then another, then
+another. Each change looks reasonable on its own. But over dozens of them the class ends
+up doing five different jobs, and every edit gets riskier. That slow accretion is what we
+call structural decay (also considered cohesive erosion). The gate scores each change against a base (`main` by default), so
+it shows up while it is still cheap to fix:
 
 ```
 impact = files_changed * Σ max(WMC_other, 1) * CC * Δlines      (over changed functions)
 ```
 
-`WMC_other` is the complexity already in the container you are editing. It is measured
-on the pre-change state. So importing a brand-new file or class is cheap. Nothing was
-there before. Piling onto an already-heavy class is expensive. That is the decay signal.
+`WMC_other` is the complexity that was already in the file or class you are editing,
+measured before your change. Adding a brand new file is cheap. There was nothing there to
+make worse. Adding a complex method to an already heavy class is expensive. The gate
+measures that difference, not the raw size of the diff.
 
 For the reasoning behind the formula, see [Measuring the Blast Radius of
 Change](https://blog.officefloor.net/2026/08/measuring-blast-radius-of-change.html) on
@@ -22,14 +28,41 @@ the OfficeFloor blog.
 When impact is too high, the gate asks you to simplify the change or refactor the code
 it touches. It can warn (report only) or block (fail the build).
 
+## How this differs from SonarQube (and other static analysis)
+
+SonarQube and linters score the **state** of the code. This file is too complex, this
+method too long, this block duplicated.
+
+ImpactGate scores the **marginal cost of a change**, weighted by what it lands on. The
+`WMC_other` term in the formula is the complexity already in the class *before* you
+touched it. A complex method in a brand new file is cheap. The same method added to a 
+class already carrying five responsibilities is expensive. It's the increment that turns 
+a heavy class into a god class nobody can safely edit.
+
+## Languages
+
+The gate is language agnostic. It scores changes in any of these languages:
+
+Java, C#, C, C++, JavaScript, TypeScript, Python, Go, Kotlin, Swift, Ruby, PHP, Rust,
+Scala, Objective-C, Lua, and TTCN-3.
+
+Complexity is parsed per function by [lizard](https://github.com/terryyin/lizard). A
+mixed language repo is scored the same way throughout.
+
+You can add or remap extensions in the measure config (`lang_by_ext`).
+
+The grading curve is calibrated per language for **Python, Java, TypeScript, C#,
+JavaScript, C, Scala, and Go**. The other languages are still measured and graded. They 
+fall back to a pooled cross language distribution that holds until your project 
+baseline builds up its own history.
+
 ## Install
 
 ```bash
 pip install impact-gate         # installs the `impact-gate` command
 ```
 
-Or run it without installing anything, via the published image (git is bundled;
-mount the repo to score at `/repo`):
+Or run it without installing anything, via the published image:
 
 ```bash
 docker run --rm -v "$PWD:/repo" ghcr.io/officefloor/impact-gate \
@@ -63,8 +96,8 @@ Exit codes. `0` means ok or warn (the change is allowed). `2` means blocked (imp
 high under `--enforcement block`). `1` means a usage or environment error.
 
 Every report also lists the **files to consider for refactoring**, ranked by their share
-of the impact. The change-level number gates; the per-file ranking points at where the
-decay is concentrating, so a file quietly growing into a god-class surfaces as a
+of the impact. The change level number gates. The per file ranking points at where the
+decay is concentrating, so a file quietly growing into a god class surfaces as a
 candidate before it blocks anything.
 
 A source file whose diff is larger than `max_diff_lines` (200,000 by default, in the
@@ -82,7 +115,7 @@ impact-gate install-hook
 ```
 
 With `enforcement: block` in `.impact-gate.yml`, a commit whose impact is too high is
-blocked; on `warn` (or off) the report prints and the commit proceeds. Re-run with
+blocked. On `warn` (or off) the report prints and the commit proceeds. Rerun with
 `--force` to overwrite an existing pre-commit hook.
 
 Prefer the [pre-commit](https://pre-commit.com) framework? This repo ships a hook
@@ -98,7 +131,7 @@ repos:
 
 ## Grade against a distribution (the curve)
 
-A raw threshold is hard to set: a typical change's impact varies by orders of magnitude
+A raw threshold is hard to set. A typical change's impact varies by orders of magnitude
 across languages and projects. Instead of guessing a number, grade a change by its
 **percentile** against a distribution, and gate on the percentile.
 
@@ -113,16 +146,32 @@ impact-gate score --curve --warn-percentile 90 --block-percentile 98
 
 The grade blends two distributions:
 
-- a **seed prior** shipped with the tool — per-language percentile tables built from a
-  20-repo open-source corpus, with a pooled fallback for languages not in the table;
-- the **project baseline** — the repo's own per-change distribution, walked from the
-  merged mainline (only landed work; in-flight branches are never reached).
+- a **seed prior** shipped with the tool. Per language percentile tables built from
+  20 open source repositories, with a pooled fallback for languages not in the table.
+- the **project baseline** using the repo's own per change distribution, walked from the
+  merged mainline.
 
 The blend weights the project by `w = n / (n + K)`, where `n` is the number of landed
-changes behind the baseline and `K` (`curve_prior_weight`, default 200) is how much
+changes behind the baseline and `K` (`curve_prior_weight`, default 200). It is how much
 history it takes to trust the project over the seed. A fresh repo with no baseline file
-grades on the seed alone; a deep history leans on itself. The grade shows in every
+grades on the seed alone. A deep history leans on itself. The grade shows in every
 format next to the raw number.
+
+## Gate on cognitive complexity (deeply-nested methods)
+
+Change-impact and the curve both measure *how a change moves*. It cannot see a method that
+is simply hard to read (working code with deep decision nesting). That is the shape AI code
+generators typically produce.
+
+`--cognitive-max N` turns on an **absolute per-method** gate on **Cognitive Complexity**
+(Campbell 2018). A change blocks when any method in a changed file exceeds `N`. It is
+independent of the impact number. A small diff can pass on impact yet block here for leaving
+a tangled method behind.
+
+```sh
+# Block any change that leaves a method with cognitive complexity over 15 (SonarSource's line).
+impact-gate score --enforcement block --cognitive-max 15
+```
 
 ## Configure with `.impact-gate.yml` (repo root)
 
@@ -132,6 +181,7 @@ block_at: 200000        # impact above which to block
 enforcement: warn       # off, warn, or block. Start on warn. Flip to block when ready.
 tolerance: 1.0          # CI-adjustable multiplier on both thresholds. Above 1 is more lenient.
 # measure_config: .impact-measure.yml   # optional: ignore globs and language overrides
+cognitive_max: 15       # block a method over this Cognitive Complexity (null/omitted = off)
 
 # Grading curve (percentile gate). When enabled, warn_at/block_at are ignored and the
 # gate uses the percentiles below instead.
@@ -142,14 +192,17 @@ curve_prior_weight: 200        # K in w = n/(n+K): history needed to trust the p
 baseline_file: .impact-gate-baseline.json   # where `impact-gate baseline` caches the distribution
 ```
 
+The cognitive gate is independent of the curve: it can run alongside either the absolute or the
+percentile impact gate, or on its own.
+
 CLI flags override the file. A CI job can pass `--tolerance` or `--warn-at`. So a team
-can dial tolerance without editing the repo. The curve knobs have flags too: `--curve`,
+can dial tolerance without editing the repo. The curve dials have flags too: `--curve`,
 `--warn-percentile`, `--block-percentile`, `--baseline-file`.
 
 ## Use in GitHub Actions
 
 Add a workflow to your repo. The action scores the PR branch against its base and writes
-a summary. `fetch-depth: 0` is required so the base branch and merge-base are present.
+a summary. `fetch-depth: 0` is required so the base branch and merge base are present.
 
 ```yaml
 name: Change impact
@@ -174,12 +227,12 @@ jobs:
 
 The score appears in the job summary and as a sticky comment on the PR (one comment,
 updated each run). In `block` mode the job fails when impact exceeds the block threshold.
-Make the check required in branch protection to gate merges. The comment needs
+Make the check required in branch protection to gate merges. Adding the PR comment needs
 `pull-requests: write`. Without it the run still passes and just skips the comment.
 
 ## Use in GitLab CI
 
-A ready-made job is in [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml). Copy it into your
+A ready made job is in [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml). Copy it into your
 `.gitlab-ci.yml`, or include it remotely:
 
 ```yaml
@@ -187,12 +240,11 @@ include:
   - remote: 'https://raw.githubusercontent.com/officefloor/ImpactGate/v0/ci/gitlab-ci.yml'
 ```
 
-It runs on merge-request pipelines, scores the MR against its base
-(`$CI_MERGE_REQUEST_DIFF_BASE_SHA`) with the published Docker image, and — when a CI/CD
-variable `GITLAB_TOKEN` with the `api` scope is set — posts a sticky note to the MR (one
-note, updated each run). Without the token it still scores and gates; it just skips the
-note. In `block` enforcement the job fails when impact is too high; make it required in
-the merge request settings to gate merges.
+It runs on merge request pipelines, scores the MR against its base
+(`$CI_MERGE_REQUEST_DIFF_BASE_SHA`) with the published Docker image, and posts a sticky note 
+to the MR (one note, updated each run). Without the required `GITLAB_TOKEN` token it still 
+scores and gates. It just skips the note. In `block` enforcement the job fails when impact is 
+too high. Make it required in the merge request settings to gate merges.
 
 ## Use in Jenkins
 
@@ -200,20 +252,5 @@ A pipeline snippet is in [`ci/Jenkinsfile`](ci/Jenkinsfile). It runs the Docker 
 an agent with Docker, scoring the change against its target branch
 (`origin/${CHANGE_TARGET:-main}`) and archiving the report. In `block` enforcement the
 stage fails when impact is too high. Posting the score back to the PR/MR is left to your
-SCM integration; to post it with the tool itself, run `impact-gate comment` in the
+SCM integration. To post it with the tool itself, run `impact-gate comment` in the
 container with the provider's token and env set.
-
-## Roadmap
-
-- Core CLI. Score staged, worktree, or range. Warn or block. Text, JSON, markdown. Done.
-- GitHub Action. Composite action, job-summary report, and a sticky PR comment. Done.
-- Baseline and grading curve. `impact-gate baseline` profiles the project history; the
-  gate blends a seed-corpus prior with the project's own distribution and grades a change
-  by its percentile (`score --curve`). Done.
-- Distribution. `pip install impact-gate`, a `ghcr.io/officefloor/impact-gate` Docker
-  image for any CI, and a version-tagged Action (`@v0`). Done.
-- More CI plugins. A GitLab CI template and a Jenkins pipeline snippet, both wrapping the
-  Docker image (`ci/gitlab-ci.yml`, `ci/Jenkinsfile`). GitLab posts a sticky MR note. Done.
-- Hooks. `impact-gate install-hook` installs a git pre-commit hook, and a
-  `.pre-commit-hooks.yaml` supports the pre-commit framework. Done.
-- IDE. Editor integration over LSP, with a live gauge as you edit.
